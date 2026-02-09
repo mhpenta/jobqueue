@@ -1,0 +1,12 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries:
+      - "backend/postgresqueue/schema/queries/*.sql"
+    schema:
+      - "backend/postgresqueue/schema/schema/*.sql"
+    gen:
+      go:
+        package: "db"
+        out: "backend/postgresqueue/db"
+        sql_package: "database/sql"

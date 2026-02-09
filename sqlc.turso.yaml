@@ -1,0 +1,14 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    queries:
+      - "backend/tursoqueue/schema/queries/*.sql"
+    schema:
+      - "backend/tursoqueue/schema/schema/*.sql"
+    gen:
+      go:
+        package: "db"
+        out: "backend/tursoqueue/db"
+        sql_package: "database/sql"
+    rules:
+      - sqlite
