@@ -36,3 +36,49 @@ CREATE TABLE IF NOT EXISTS job_queue_dlq (
 -- Index for viewing DLQ by queue
 CREATE INDEX IF NOT EXISTS idx_job_queue_dlq_queue
 ON job_queue_dlq(queue_name, failed_at DESC);
+
+-- Readable, derived view for ad-hoc debugging/ops queries.
+-- This does not change queue behavior; it only exposes computed columns.
+CREATE VIEW IF NOT EXISTS job_queue_readable AS
+SELECT
+    id,
+    queue_name,
+    job_type,
+    priority,
+    retry_count,
+    max_retries,
+    visible_after,
+    datetime(visible_after, 'unixepoch') AS visible_after_ts,
+    created_at,
+    datetime(created_at, 'unixepoch') AS created_at_ts,
+    completed_at,
+    CASE
+        WHEN completed_at IS NULL THEN NULL
+        ELSE datetime(completed_at, 'unixepoch')
+    END AS completed_at_ts,
+    length(body) AS body_bytes,
+    substr(hex(body), 1, 240) AS body_preview_hex,
+    CASE
+        WHEN completed_at IS NOT NULL THEN 'completed'
+        WHEN retry_count >= max_retries THEN 'exhausted'
+        WHEN visible_after > CAST(strftime('%s', 'now') AS INTEGER) THEN 'scheduled'
+        ELSE 'pending'
+    END AS derived_status
+FROM job_queue;
+
+-- Readable DLQ view for ad-hoc debugging/ops queries.
+CREATE VIEW IF NOT EXISTS job_queue_dlq_readable AS
+SELECT
+    id,
+    queue_name,
+    job_type,
+    priority,
+    retry_count,
+    error,
+    created_at,
+    datetime(created_at, 'unixepoch') AS created_at_ts,
+    failed_at,
+    datetime(failed_at, 'unixepoch') AS failed_at_ts,
+    length(body) AS body_bytes,
+    substr(hex(body), 1, 240) AS body_preview_hex
+FROM job_queue_dlq;

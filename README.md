@@ -58,3 +58,23 @@ _ = err
 ```
 
 `scheduler.NewMemoryStore()` is in-process only. For distributed producers, implement `scheduler.KeyStateStore` with an atomic, shared backend (for example, SQL transaction + per-key row lock).
+
+## Readable SQL Views
+
+Both backend schema files now include additive read-only views:
+- `job_queue_readable`
+- `job_queue_dlq_readable`
+
+They keep Unix timestamp storage unchanged but expose:
+- derived human timestamps
+- derived status (`pending`, `scheduled`, `completed`, `exhausted`)
+- body size + short preview column
+
+Example:
+
+```sql
+SELECT id, queue_name, job_type, derived_status, created_at_ts, visible_after_ts
+FROM job_queue_readable
+ORDER BY created_at DESC
+LIMIT 50;
+```

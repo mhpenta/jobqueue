@@ -36,3 +36,49 @@ CREATE TABLE IF NOT EXISTS job_queue_dlq (
 -- Index for viewing DLQ by queue
 CREATE INDEX IF NOT EXISTS idx_job_queue_dlq_queue
 ON job_queue_dlq(queue_name, failed_at DESC);
+
+-- Readable, derived view for ad-hoc debugging/ops queries.
+-- This does not change queue behavior; it only exposes computed columns.
+CREATE OR REPLACE VIEW job_queue_readable AS
+SELECT
+    id,
+    queue_name,
+    job_type,
+    priority,
+    retry_count,
+    max_retries,
+    visible_after,
+    to_timestamp(visible_after) AS visible_after_ts,
+    created_at,
+    to_timestamp(created_at) AS created_at_ts,
+    completed_at,
+    CASE
+        WHEN completed_at IS NULL THEN NULL
+        ELSE to_timestamp(completed_at)
+    END AS completed_at_ts,
+    octet_length(body) AS body_bytes,
+    LEFT(encode(body, 'escape'), 240) AS body_preview,
+    CASE
+        WHEN completed_at IS NOT NULL THEN 'completed'
+        WHEN retry_count >= max_retries THEN 'exhausted'
+        WHEN visible_after > EXTRACT(EPOCH FROM NOW())::BIGINT THEN 'scheduled'
+        ELSE 'pending'
+    END AS derived_status
+FROM job_queue;
+
+-- Readable DLQ view for ad-hoc debugging/ops queries.
+CREATE OR REPLACE VIEW job_queue_dlq_readable AS
+SELECT
+    id,
+    queue_name,
+    job_type,
+    priority,
+    retry_count,
+    error,
+    created_at,
+    to_timestamp(created_at) AS created_at_ts,
+    failed_at,
+    to_timestamp(failed_at) AS failed_at_ts,
+    octet_length(body) AS body_bytes,
+    LEFT(encode(body, 'escape'), 240) AS body_preview
+FROM job_queue_dlq;
