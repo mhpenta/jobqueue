@@ -9,8 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -70,17 +68,7 @@ func applySchema(db *sql.DB) error {
 	if err := dropTables(db); err != nil {
 		return err
 	}
-	_, filename, _, ok := runtime.Caller(0)
-	if !ok {
-		return errors.New("failed to locate test file path")
-	}
-	schemaPath := filepath.Join(filepath.Dir(filename), "schema", "schema", "001_queue.sql")
-	schema, err := os.ReadFile(schemaPath)
-	if err != nil {
-		return err
-	}
-	_, err = db.Exec(string(schema))
-	return err
+	return postgresqueue.EnsureSchema(context.Background(), db)
 }
 
 func dropTables(db *sql.DB) error {

@@ -23,6 +23,21 @@ if msg != nil {
 }
 ```
 
+## Backend Schema Bootstrap
+
+The Postgres backend exports its canonical schema so callers do not need to copy
+the queue DDL into their own application bootstrap:
+
+```go
+if err := postgresqueue.EnsureSchema(ctx, db); err != nil {
+	log.Fatal(err)
+}
+
+queue := postgresqueue.New(db, jobqueue.DefaultConfig())
+```
+
+If you only need the SQL string, use `postgresqueue.SchemaSQL()`.
+
 ## Policy-Based Scheduling Helper
 
 The `scheduler` helper package supports:
