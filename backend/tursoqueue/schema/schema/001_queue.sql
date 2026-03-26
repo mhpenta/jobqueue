@@ -1,15 +1,22 @@
 -- Job queue table (pending + completed jobs)
 CREATE TABLE IF NOT EXISTS job_queue (
     id            TEXT PRIMARY KEY NOT NULL,
+    job_key       TEXT NOT NULL DEFAULT '',
     queue_name    TEXT NOT NULL,
     job_type      TEXT NOT NULL,
     body          BLOB NOT NULL,
+    metadata      TEXT NOT NULL DEFAULT '{}',
     priority      INTEGER NOT NULL DEFAULT 0,
     visible_after INTEGER NOT NULL,  -- Unix timestamp: visible when now >= visible_after
     created_at    INTEGER NOT NULL,
+    claimed_at    INTEGER,
+    claimed_by    TEXT NOT NULL DEFAULT '',
     retry_count   INTEGER NOT NULL DEFAULT 0,
     max_retries   INTEGER NOT NULL DEFAULT 3,
-    completed_at  INTEGER  -- NULL = pending, set = completed
+    completed_at  INTEGER,  -- NULL = pending, set = completed
+    terminal_code TEXT NOT NULL DEFAULT '',
+    terminal_summary TEXT NOT NULL DEFAULT '',
+    result_json   TEXT NOT NULL DEFAULT '{}'
 );
 
 -- Index for atomic dequeue: find visible pending jobs
@@ -20,17 +27,28 @@ ON job_queue(queue_name, completed_at, visible_after, priority DESC, created_at 
 CREATE INDEX IF NOT EXISTS idx_job_queue_completed
 ON job_queue(queue_name, completed_at DESC);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_job_queue_job_key
+ON job_queue(queue_name, job_key)
+WHERE job_key <> '';
+
 -- Dead letter queue for failed jobs
 CREATE TABLE IF NOT EXISTS job_queue_dlq (
     id          TEXT PRIMARY KEY NOT NULL,
+    job_key     TEXT NOT NULL DEFAULT '',
     queue_name  TEXT NOT NULL,
     job_type    TEXT NOT NULL,
     body        BLOB NOT NULL,
+    metadata    TEXT NOT NULL DEFAULT '{}',
     priority    INTEGER NOT NULL,
     created_at  INTEGER NOT NULL,
     failed_at   INTEGER NOT NULL,
+    claimed_at  INTEGER,
+    claimed_by  TEXT NOT NULL DEFAULT '',
     retry_count INTEGER NOT NULL,
-    error       TEXT NOT NULL
+    error       TEXT NOT NULL,
+    terminal_code TEXT NOT NULL DEFAULT '',
+    terminal_summary TEXT NOT NULL DEFAULT '',
+    result_json TEXT NOT NULL DEFAULT '{}'
 );
 
 -- Index for viewing DLQ by queue
@@ -42,11 +60,18 @@ ON job_queue_dlq(queue_name, failed_at DESC);
 CREATE VIEW IF NOT EXISTS job_queue_readable AS
 SELECT
     id,
+    job_key,
     queue_name,
     job_type,
     priority,
     retry_count,
     max_retries,
+    claimed_at,
+    CASE
+        WHEN claimed_at IS NULL THEN NULL
+        ELSE datetime(claimed_at, 'unixepoch')
+    END AS claimed_at_ts,
+    claimed_by,
     visible_after,
     datetime(visible_after, 'unixepoch') AS visible_after_ts,
     created_at,
@@ -56,6 +81,10 @@ SELECT
         WHEN completed_at IS NULL THEN NULL
         ELSE datetime(completed_at, 'unixepoch')
     END AS completed_at_ts,
+    terminal_code,
+    terminal_summary,
+    metadata,
+    result_json,
     length(body) AS body_bytes,
     substr(hex(body), 1, 240) AS body_preview_hex,
     CASE
@@ -70,15 +99,77 @@ FROM job_queue;
 CREATE VIEW IF NOT EXISTS job_queue_dlq_readable AS
 SELECT
     id,
+    job_key,
     queue_name,
     job_type,
     priority,
     retry_count,
     error,
+    claimed_at,
+    CASE
+        WHEN claimed_at IS NULL THEN NULL
+        ELSE datetime(claimed_at, 'unixepoch')
+    END AS claimed_at_ts,
+    claimed_by,
+    terminal_code,
+    terminal_summary,
+    metadata,
+    result_json,
     created_at,
     datetime(created_at, 'unixepoch') AS created_at_ts,
     failed_at,
     datetime(failed_at, 'unixepoch') AS failed_at_ts,
     length(body) AS body_bytes,
+    substr(hex(body), 1, 240) AS body_preview_hex
+FROM job_queue_dlq;
+
+CREATE VIEW IF NOT EXISTS job_queue_all_readable AS
+SELECT
+    'queue' AS source_table,
+    id,
+    job_key,
+    queue_name,
+    job_type,
+    priority,
+    retry_count,
+    max_retries,
+    claimed_at,
+    datetime(claimed_at, 'unixepoch') AS claimed_at_ts,
+    claimed_by,
+    created_at,
+    datetime(created_at, 'unixepoch') AS created_at_ts,
+    completed_at,
+    datetime(completed_at, 'unixepoch') AS completed_at_ts,
+    NULL AS failed_at,
+    NULL AS failed_at_ts,
+    terminal_code,
+    terminal_summary,
+    metadata,
+    result_json,
+    substr(hex(body), 1, 240) AS body_preview_hex
+FROM job_queue
+UNION ALL
+SELECT
+    'dlq' AS source_table,
+    id,
+    job_key,
+    queue_name,
+    job_type,
+    priority,
+    retry_count,
+    NULL AS max_retries,
+    claimed_at,
+    datetime(claimed_at, 'unixepoch') AS claimed_at_ts,
+    claimed_by,
+    created_at,
+    datetime(created_at, 'unixepoch') AS created_at_ts,
+    NULL AS completed_at,
+    NULL AS completed_at_ts,
+    failed_at,
+    datetime(failed_at, 'unixepoch') AS failed_at_ts,
+    terminal_code,
+    terminal_summary,
+    metadata,
+    result_json,
     substr(hex(body), 1, 240) AS body_preview_hex
 FROM job_queue_dlq;

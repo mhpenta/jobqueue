@@ -9,26 +9,114 @@ import (
 )
 
 type JobQueue struct {
-	ID           string
-	QueueName    string
-	JobType      string
-	Body         []byte
-	Priority     int64
-	VisibleAfter int64
-	CreatedAt    int64
-	RetryCount   int64
-	MaxRetries   int64
-	CompletedAt  sql.NullInt64
+	ID              string
+	JobKey          string
+	QueueName       string
+	JobType         string
+	Body            []byte
+	Metadata        string
+	Priority        int64
+	VisibleAfter    int64
+	CreatedAt       int64
+	ClaimedAt       sql.NullInt64
+	ClaimedBy       string
+	RetryCount      int64
+	MaxRetries      int64
+	CompletedAt     sql.NullInt64
+	TerminalCode    string
+	TerminalSummary string
+	ResultJson      string
+}
+
+type JobQueueAllReadable struct {
+	SourceTable     string
+	ID              string
+	JobKey          string
+	QueueName       string
+	JobType         string
+	Priority        int64
+	RetryCount      int64
+	MaxRetries      int64
+	ClaimedAt       sql.NullInt64
+	ClaimedAtTs     interface{}
+	ClaimedBy       string
+	CreatedAt       int64
+	CreatedAtTs     interface{}
+	CompletedAt     sql.NullInt64
+	CompletedAtTs   interface{}
+	FailedAt        interface{}
+	FailedAtTs      interface{}
+	TerminalCode    string
+	TerminalSummary string
+	Metadata        string
+	ResultJson      string
+	BodyPreviewHex  string
 }
 
 type JobQueueDlq struct {
-	ID         string
-	QueueName  string
-	JobType    string
-	Body       []byte
-	Priority   int64
-	CreatedAt  int64
-	FailedAt   int64
-	RetryCount int64
-	Error      string
+	ID              string
+	JobKey          string
+	QueueName       string
+	JobType         string
+	Body            []byte
+	Metadata        string
+	Priority        int64
+	CreatedAt       int64
+	FailedAt        int64
+	ClaimedAt       sql.NullInt64
+	ClaimedBy       string
+	RetryCount      int64
+	Error           string
+	TerminalCode    string
+	TerminalSummary string
+	ResultJson      string
+}
+
+type JobQueueDlqReadable struct {
+	ID              string
+	JobKey          string
+	QueueName       string
+	JobType         string
+	Priority        int64
+	RetryCount      int64
+	Error           string
+	ClaimedAt       sql.NullInt64
+	ClaimedAtTs     interface{}
+	ClaimedBy       string
+	TerminalCode    string
+	TerminalSummary string
+	Metadata        string
+	ResultJson      string
+	CreatedAt       int64
+	CreatedAtTs     interface{}
+	FailedAt        int64
+	FailedAtTs      interface{}
+	BodyBytes       sql.NullInt64
+	BodyPreviewHex  string
+}
+
+type JobQueueReadable struct {
+	ID              string
+	JobKey          string
+	QueueName       string
+	JobType         string
+	Priority        int64
+	RetryCount      int64
+	MaxRetries      int64
+	ClaimedAt       sql.NullInt64
+	ClaimedAtTs     interface{}
+	ClaimedBy       string
+	VisibleAfter    int64
+	VisibleAfterTs  interface{}
+	CreatedAt       int64
+	CreatedAtTs     interface{}
+	CompletedAt     sql.NullInt64
+	CompletedAtTs   interface{}
+	TerminalCode    string
+	TerminalSummary string
+	Metadata        string
+	ResultJson      string
+	BodyBytes       sql.NullInt64
+	BodyPreviewHex  string
+	DerivedStatus   string
 }

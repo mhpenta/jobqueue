@@ -28,6 +28,12 @@ type EnqueueOptions struct {
 	// RunAt schedules the job to become visible at a specific time.
 	// Zero value means immediately visible.
 	RunAt time.Time
+
+	// JobKey is an optional caller-supplied idempotency key.
+	JobKey string
+
+	// Metadata is optional structured JSON data persisted alongside the job.
+	Metadata any
 }
 
 // EnqueueOption is a functional option for Enqueue.
@@ -51,6 +57,20 @@ func WithDelay(d time.Duration) EnqueueOption {
 func WithRunAt(t time.Time) EnqueueOption {
 	return func(o *EnqueueOptions) {
 		o.RunAt = t
+	}
+}
+
+// WithJobKey sets an optional idempotency key for the job.
+func WithJobKey(jobKey string) EnqueueOption {
+	return func(o *EnqueueOptions) {
+		o.JobKey = jobKey
+	}
+}
+
+// WithMetadata attaches optional structured metadata to the job.
+func WithMetadata(metadata any) EnqueueOption {
+	return func(o *EnqueueOptions) {
+		o.Metadata = metadata
 	}
 }
 

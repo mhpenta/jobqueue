@@ -3,8 +3,10 @@ package postgresqueue
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,8 +15,12 @@ import (
 )
 
 var (
-	_ jobqueue.Queue = (*PostgresQueue)(nil)
-	_ jobqueue.Admin = (*PostgresQueue)(nil)
+	_ jobqueue.Queue       = (*PostgresQueue)(nil)
+	_ jobqueue.Admin       = (*PostgresQueue)(nil)
+	_ jobqueue.UniqueQueue = (*PostgresQueue)(nil)
+	_ jobqueue.WorkerQueue = (*PostgresQueue)(nil)
+	_ jobqueue.ResultQueue = (*PostgresQueue)(nil)
+	_ jobqueue.LookupQueue = (*PostgresQueue)(nil)
 )
 
 type PostgresQueue struct {
@@ -32,11 +38,34 @@ func New(database *sql.DB, config jobqueue.Config) *PostgresQueue {
 }
 
 func (q *PostgresQueue) Enqueue(ctx context.Context, queueName string, jobType string, body []byte, opts ...jobqueue.EnqueueOption) (string, error) {
+	id, _, err := q.enqueue(ctx, queueName, jobType, body, false, opts...)
+	return id, err
+}
+
+func (q *PostgresQueue) EnqueueUnique(ctx context.Context, queueName string, jobType string, body []byte, opts ...jobqueue.EnqueueOption) (string, bool, error) {
+	return q.enqueue(ctx, queueName, jobType, body, true, opts...)
+}
+
+func (q *PostgresQueue) enqueue(ctx context.Context, queueName string, jobType string, body []byte, unique bool, opts ...jobqueue.EnqueueOption) (string, bool, error) {
 	if err := jobqueue.ValidateEnqueue(queueName, jobType, body); err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	options := jobqueue.ResolveEnqueueOptions(opts)
+	jobKey := strings.TrimSpace(options.JobKey)
+	if unique {
+		if err := jobqueue.ValidateJobKey(jobKey); err != nil {
+			return "", false, err
+		}
+	} else if jobKey != "" {
+		if err := jobqueue.ValidateJobKey(jobKey); err != nil {
+			return "", false, err
+		}
+	}
+	metadata, err := encodeJSONValue(options.Metadata)
+	if err != nil {
+		return "", false, fmt.Errorf("encode metadata: %w", err)
+	}
 
 	id := uuid.New().String()
 	now := time.Now()
@@ -51,24 +80,46 @@ func (q *PostgresQueue) Enqueue(ctx context.Context, queueName string, jobType s
 		}
 	}
 
-	_, err := q.queries.InsertJob(ctx, db.InsertJobParams{
+	params := db.InsertJobParams{
 		ID:           id,
+		JobKey:       jobKey,
 		QueueName:    queueName,
 		JobType:      jobType,
 		Body:         body,
+		Metadata:     metadata,
 		Priority:     int32(options.Priority),
 		VisibleAfter: visibleAfter,
 		CreatedAt:    nowUnix,
 		MaxRetries:   int32(q.config.MaxRetries),
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to insert job: %w", err)
+	}
+	if unique {
+		rows, err := q.queries.InsertJobUnique(ctx, db.InsertJobUniqueParams(params))
+		if err != nil {
+			return "", false, fmt.Errorf("failed to insert unique job: %w", err)
+		}
+		if len(rows) == 0 {
+			existing, err := q.GetJobByKey(ctx, queueName, jobKey)
+			if err != nil {
+				return "", false, fmt.Errorf("load existing unique job: %w", err)
+			}
+			return existing.ID, false, nil
+		}
+		return rows[0].ID, true, nil
 	}
 
-	return id, nil
+	row, err := q.queries.InsertJob(ctx, params)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to insert job: %w", err)
+	}
+
+	return row.ID, true, nil
 }
 
 func (q *PostgresQueue) Dequeue(ctx context.Context, queueName string) (*jobqueue.Message, error) {
+	return q.DequeueWithWorker(ctx, queueName, "")
+}
+
+func (q *PostgresQueue) DequeueWithWorker(ctx context.Context, queueName string, workerName string) (*jobqueue.Message, error) {
 	if err := jobqueue.ValidateQueueName(queueName); err != nil {
 		return nil, err
 	}
@@ -82,6 +133,8 @@ func (q *PostgresQueue) Dequeue(ctx context.Context, queueName string) (*jobqueu
 
 	row, err := q.queries.ClaimJob(ctx, db.ClaimJobParams{
 		VisibleAfter:   newVisibleAfter,
+		ClaimedAt:      sql.NullInt64{Int64: now, Valid: true},
+		ClaimedBy:      strings.TrimSpace(workerName),
 		QueueName:      queueName,
 		VisibleAfter_2: now,
 	})
@@ -92,31 +145,56 @@ func (q *PostgresQueue) Dequeue(ctx context.Context, queueName string) (*jobqueu
 		return nil, fmt.Errorf("failed to claim job: %w", err)
 	}
 
-	return &jobqueue.Message{
-		ID:         row.ID,
-		QueueName:  row.QueueName,
-		JobType:    row.JobType,
-		Body:       row.Body,
-		Priority:   int(row.Priority),
-		CreatedAt:  time.Unix(row.CreatedAt, 0),
-		RetryCount: int(row.RetryCount),
-		MaxRetries: int(row.MaxRetries),
-	}, nil
+	return messageFromJobRow(row), nil
 }
 
 func (q *PostgresQueue) Complete(ctx context.Context, jobID string) error {
+	return q.complete(ctx, jobID, nil)
+}
+
+func (q *PostgresQueue) CompleteWithResult(ctx context.Context, jobID string, result jobqueue.JobResult) error {
+	return q.complete(ctx, jobID, &result)
+}
+
+func (q *PostgresQueue) complete(ctx context.Context, jobID string, result *jobqueue.JobResult) error {
 	if err := jobqueue.ValidateJobID(jobID); err != nil {
 		return err
 	}
 	now := time.Now().Unix()
-	result, err := q.queries.CompleteJob(ctx, db.CompleteJobParams{
-		CompletedAt: sql.NullInt64{Int64: now, Valid: true},
-		ID:          jobID,
+	if result == nil {
+		res, err := q.queries.CompleteJob(ctx, db.CompleteJobParams{
+			CompletedAt: sql.NullInt64{Int64: now, Valid: true},
+			ID:          jobID,
+		})
+		if err != nil {
+			return err
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return jobqueue.ErrJobNotFound
+		}
+		return nil
+	}
+
+	payloadJSON, err := encodeJSONValue(result.Payload)
+	if err != nil {
+		return fmt.Errorf("encode result payload: %w", err)
+	}
+
+	res, err := q.queries.CompleteJobWithResult(ctx, db.CompleteJobWithResultParams{
+		CompletedAt:     sql.NullInt64{Int64: now, Valid: true},
+		TerminalCode:    strings.TrimSpace(result.Code),
+		TerminalSummary: strings.TrimSpace(result.Summary),
+		ResultJson:      payloadJSON,
+		ID:              jobID,
 	})
 	if err != nil {
 		return err
 	}
-	rows, err := result.RowsAffected()
+	rows, err := res.RowsAffected()
 	if err != nil {
 		return err
 	}
@@ -148,6 +226,10 @@ func (q *PostgresQueue) Retry(ctx context.Context, jobID string) error {
 }
 
 func (q *PostgresQueue) Fail(ctx context.Context, jobID string, jobErr error) error {
+	return q.FailWithResult(ctx, jobID, jobErr, jobqueue.JobResult{})
+}
+
+func (q *PostgresQueue) FailWithResult(ctx context.Context, jobID string, jobErr error, result jobqueue.JobResult) error {
 	if err := jobqueue.ValidateJobID(jobID); err != nil {
 		return err
 	}
@@ -155,6 +237,10 @@ func (q *PostgresQueue) Fail(ctx context.Context, jobID string, jobErr error) er
 	errMsg := ""
 	if jobErr != nil {
 		errMsg = jobErr.Error()
+	}
+	resultJSON, err := encodeJSONValue(result.Payload)
+	if err != nil {
+		return fmt.Errorf("encode result payload: %w", err)
 	}
 
 	tx, err := q.db.BeginTx(ctx, nil)
@@ -179,15 +265,22 @@ func (q *PostgresQueue) Fail(ctx context.Context, jobID string, jobErr error) er
 	now := time.Now().Unix()
 
 	err = qtx.InsertDLQ(ctx, db.InsertDLQParams{
-		ID:         job.ID,
-		QueueName:  job.QueueName,
-		JobType:    job.JobType,
-		Body:       job.Body,
-		Priority:   job.Priority,
-		CreatedAt:  job.CreatedAt,
-		FailedAt:   now,
-		RetryCount: job.RetryCount,
-		Error:      errMsg,
+		ID:              job.ID,
+		JobKey:          job.JobKey,
+		QueueName:       job.QueueName,
+		JobType:         job.JobType,
+		Body:            job.Body,
+		Metadata:        job.Metadata,
+		Priority:        job.Priority,
+		CreatedAt:       job.CreatedAt,
+		FailedAt:        now,
+		ClaimedAt:       job.ClaimedAt,
+		ClaimedBy:       job.ClaimedBy,
+		RetryCount:      job.RetryCount,
+		Error:           errMsg,
+		TerminalCode:    strings.TrimSpace(result.Code),
+		TerminalSummary: strings.TrimSpace(result.Summary),
+		ResultJson:      resultJSON,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to insert into DLQ: %w", err)
@@ -198,4 +291,144 @@ func (q *PostgresQueue) Fail(ctx context.Context, jobID string, jobErr error) er
 	}
 
 	return tx.Commit()
+}
+
+func (q *PostgresQueue) GetJob(ctx context.Context, jobID string) (*jobqueue.Message, error) {
+	if err := jobqueue.ValidateJobID(jobID); err != nil {
+		return nil, err
+	}
+	row, err := q.queries.GetJob(ctx, jobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, jobqueue.ErrJobNotFound
+		}
+		return nil, fmt.Errorf("get job: %w", err)
+	}
+	return messageFromJobRow(row), nil
+}
+
+func (q *PostgresQueue) GetJobByKey(ctx context.Context, queueName string, jobKey string) (*jobqueue.Message, error) {
+	if err := jobqueue.ValidateQueueName(queueName); err != nil {
+		return nil, err
+	}
+	if err := jobqueue.ValidateJobKey(jobKey); err != nil {
+		return nil, err
+	}
+	row, err := q.queries.GetJobByKey(ctx, db.GetJobByKeyParams{
+		QueueName: queueName,
+		JobKey:    strings.TrimSpace(jobKey),
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, jobqueue.ErrJobNotFound
+		}
+		return nil, fmt.Errorf("get job by key: %w", err)
+	}
+	return messageFromJobRow(row), nil
+}
+
+func (q *PostgresQueue) GetDLQJob(ctx context.Context, jobID string) (*jobqueue.DLQMessage, error) {
+	if err := jobqueue.ValidateJobID(jobID); err != nil {
+		return nil, err
+	}
+	row, err := q.queries.GetDLQJob(ctx, jobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, jobqueue.ErrJobNotFound
+		}
+		return nil, fmt.Errorf("get dlq job: %w", err)
+	}
+	return dlqMessageFromRow(row), nil
+}
+
+func (q *PostgresQueue) GetDLQJobByKey(ctx context.Context, queueName string, jobKey string) (*jobqueue.DLQMessage, error) {
+	if err := jobqueue.ValidateQueueName(queueName); err != nil {
+		return nil, err
+	}
+	if err := jobqueue.ValidateJobKey(jobKey); err != nil {
+		return nil, err
+	}
+	row, err := q.queries.GetDLQJobByKey(ctx, db.GetDLQJobByKeyParams{
+		QueueName: queueName,
+		JobKey:    strings.TrimSpace(jobKey),
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, jobqueue.ErrJobNotFound
+		}
+		return nil, fmt.Errorf("get dlq job by key: %w", err)
+	}
+	return dlqMessageFromRow(row), nil
+}
+
+func encodeJSONValue(value any) (json.RawMessage, error) {
+	switch v := value.(type) {
+	case nil:
+		return json.RawMessage(`{}`), nil
+	case json.RawMessage:
+		if len(v) == 0 {
+			return json.RawMessage(`{}`), nil
+		}
+		return append(json.RawMessage(nil), v...), nil
+	case []byte:
+		if len(v) == 0 {
+			return json.RawMessage(`{}`), nil
+		}
+		return append(json.RawMessage(nil), v...), nil
+	default:
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		return json.RawMessage(raw), nil
+	}
+}
+
+func nullUnixTime(value sql.NullInt64) time.Time {
+	if !value.Valid {
+		return time.Time{}
+	}
+	return time.Unix(value.Int64, 0)
+}
+
+func messageFromJobRow(row db.JobQueue) *jobqueue.Message {
+	return &jobqueue.Message{
+		ID:              row.ID,
+		JobKey:          row.JobKey,
+		QueueName:       row.QueueName,
+		JobType:         row.JobType,
+		Body:            row.Body,
+		Metadata:        append(json.RawMessage(nil), row.Metadata...),
+		Priority:        int(row.Priority),
+		CreatedAt:       time.Unix(row.CreatedAt, 0),
+		ClaimedAt:       nullUnixTime(row.ClaimedAt),
+		ClaimedBy:       row.ClaimedBy,
+		CompletedAt:     nullUnixTime(row.CompletedAt),
+		TerminalCode:    row.TerminalCode,
+		TerminalSummary: row.TerminalSummary,
+		ResultJSON:      append(json.RawMessage(nil), row.ResultJson...),
+		RetryCount:      int(row.RetryCount),
+		MaxRetries:      int(row.MaxRetries),
+	}
+}
+
+func dlqMessageFromRow(row db.JobQueueDlq) *jobqueue.DLQMessage {
+	return &jobqueue.DLQMessage{
+		ID:              row.ID,
+		JobKey:          row.JobKey,
+		QueueName:       row.QueueName,
+		JobType:         row.JobType,
+		Body:            row.Body,
+		Metadata:        append(json.RawMessage(nil), row.Metadata...),
+		Priority:        int(row.Priority),
+		CreatedAt:       time.Unix(row.CreatedAt, 0),
+		FailedAt:        time.Unix(row.FailedAt, 0),
+		ClaimedAt:       nullUnixTime(row.ClaimedAt),
+		ClaimedBy:       row.ClaimedBy,
+		RetryCount:      int(row.RetryCount),
+		Error:           row.Error,
+		TerminalCode:    row.TerminalCode,
+		TerminalSummary: row.TerminalSummary,
+		ResultJSON:      append(json.RawMessage(nil), row.ResultJson...),
+	}
 }

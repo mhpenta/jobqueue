@@ -1,16 +1,27 @@
 package jobqueue
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Message contains a job's data and metadata from the queue.
 // The queue does not interpret Body — consumers deserialize it themselves.
 type Message struct {
-	ID        string
-	QueueName string
-	JobType   string
-	Body      []byte
-	Priority  int
-	CreatedAt time.Time
+	ID              string
+	JobKey          string
+	QueueName       string
+	JobType         string
+	Body            []byte
+	Metadata        json.RawMessage
+	Priority        int
+	CreatedAt       time.Time
+	ClaimedAt       time.Time
+	ClaimedBy       string
+	CompletedAt     time.Time
+	TerminalCode    string
+	TerminalSummary string
+	ResultJSON      json.RawMessage
 
 	// RetryCount is the total number of recorded failures for this job.
 	// It is incremented by Retry (and other failure paths), NOT by Dequeue.

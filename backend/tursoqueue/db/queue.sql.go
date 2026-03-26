@@ -12,7 +12,9 @@ import (
 
 const claimJob = `-- name: ClaimJob :one
 UPDATE job_queue
-SET visible_after = ?
+SET visible_after = ?,
+    claimed_at = ?,
+    claimed_by = ?
 WHERE id = (
     SELECT jq.id FROM job_queue jq
     WHERE jq.queue_name = ?
@@ -25,30 +27,45 @@ WHERE id = (
     ORDER BY jq.priority DESC, jq.created_at ASC
     LIMIT 1
 )
-RETURNING id, queue_name, job_type, body, priority, visible_after, created_at, retry_count, max_retries, completed_at
+RETURNING id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, completed_at, terminal_code, terminal_summary, result_json
 `
 
 type ClaimJobParams struct {
 	VisibleAfter   int64
+	ClaimedAt      sql.NullInt64
+	ClaimedBy      string
 	QueueName      string
 	VisibleAfter_2 int64
 }
 
 // Atomically claim the next available pending job.
 func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (JobQueue, error) {
-	row := q.db.QueryRowContext(ctx, claimJob, arg.VisibleAfter, arg.QueueName, arg.VisibleAfter_2)
+	row := q.db.QueryRowContext(ctx, claimJob,
+		arg.VisibleAfter,
+		arg.ClaimedAt,
+		arg.ClaimedBy,
+		arg.QueueName,
+		arg.VisibleAfter_2,
+	)
 	var i JobQueue
 	err := row.Scan(
 		&i.ID,
+		&i.JobKey,
 		&i.QueueName,
 		&i.JobType,
 		&i.Body,
+		&i.Metadata,
 		&i.Priority,
 		&i.VisibleAfter,
 		&i.CreatedAt,
+		&i.ClaimedAt,
+		&i.ClaimedBy,
 		&i.RetryCount,
 		&i.MaxRetries,
 		&i.CompletedAt,
+		&i.TerminalCode,
+		&i.TerminalSummary,
+		&i.ResultJson,
 	)
 	return i, err
 }
@@ -74,6 +91,33 @@ type CompleteJobParams struct {
 
 func (q *Queries) CompleteJob(ctx context.Context, arg CompleteJobParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, completeJob, arg.CompletedAt, arg.ID)
+}
+
+const completeJobWithResult = `-- name: CompleteJobWithResult :execresult
+UPDATE job_queue
+SET completed_at = ?,
+    terminal_code = ?,
+    terminal_summary = ?,
+    result_json = ?
+WHERE id = ?
+`
+
+type CompleteJobWithResultParams struct {
+	CompletedAt     sql.NullInt64
+	TerminalCode    string
+	TerminalSummary string
+	ResultJson      string
+	ID              string
+}
+
+func (q *Queries) CompleteJobWithResult(ctx context.Context, arg CompleteJobWithResultParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, completeJobWithResult,
+		arg.CompletedAt,
+		arg.TerminalCode,
+		arg.TerminalSummary,
+		arg.ResultJson,
+		arg.ID,
+	)
 }
 
 const countCompletedJobs = `-- name: CountCompletedJobs :one
@@ -128,7 +172,7 @@ func (q *Queries) DeleteJob(ctx context.Context, id string) error {
 }
 
 const getDLQJob = `-- name: GetDLQJob :one
-SELECT id, queue_name, job_type, body, priority, created_at, failed_at, retry_count, error FROM job_queue_dlq WHERE id = ?
+SELECT id, job_key, queue_name, job_type, body, metadata, priority, created_at, failed_at, claimed_at, claimed_by, retry_count, error, terminal_code, terminal_summary, result_json FROM job_queue_dlq WHERE id = ?
 `
 
 func (q *Queries) GetDLQJob(ctx context.Context, id string) (JobQueueDlq, error) {
@@ -136,20 +180,60 @@ func (q *Queries) GetDLQJob(ctx context.Context, id string) (JobQueueDlq, error)
 	var i JobQueueDlq
 	err := row.Scan(
 		&i.ID,
+		&i.JobKey,
 		&i.QueueName,
 		&i.JobType,
 		&i.Body,
+		&i.Metadata,
 		&i.Priority,
 		&i.CreatedAt,
 		&i.FailedAt,
+		&i.ClaimedAt,
+		&i.ClaimedBy,
 		&i.RetryCount,
 		&i.Error,
+		&i.TerminalCode,
+		&i.TerminalSummary,
+		&i.ResultJson,
+	)
+	return i, err
+}
+
+const getDLQJobByKey = `-- name: GetDLQJobByKey :one
+SELECT id, job_key, queue_name, job_type, body, metadata, priority, created_at, failed_at, claimed_at, claimed_by, retry_count, error, terminal_code, terminal_summary, result_json FROM job_queue_dlq WHERE queue_name = ? AND job_key = ?
+`
+
+type GetDLQJobByKeyParams struct {
+	QueueName string
+	JobKey    string
+}
+
+func (q *Queries) GetDLQJobByKey(ctx context.Context, arg GetDLQJobByKeyParams) (JobQueueDlq, error) {
+	row := q.db.QueryRowContext(ctx, getDLQJobByKey, arg.QueueName, arg.JobKey)
+	var i JobQueueDlq
+	err := row.Scan(
+		&i.ID,
+		&i.JobKey,
+		&i.QueueName,
+		&i.JobType,
+		&i.Body,
+		&i.Metadata,
+		&i.Priority,
+		&i.CreatedAt,
+		&i.FailedAt,
+		&i.ClaimedAt,
+		&i.ClaimedBy,
+		&i.RetryCount,
+		&i.Error,
+		&i.TerminalCode,
+		&i.TerminalSummary,
+		&i.ResultJson,
 	)
 	return i, err
 }
 
 const getJob = `-- name: GetJob :one
-SELECT id, queue_name, job_type, body, priority, visible_after, created_at, retry_count, max_retries, completed_at FROM job_queue WHERE id = ?
+SELECT id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, completed_at, terminal_code, terminal_summary, result_json FROM job_queue WHERE id = ?
 `
 
 func (q *Queries) GetJob(ctx context.Context, id string) (JobQueue, error) {
@@ -157,21 +241,62 @@ func (q *Queries) GetJob(ctx context.Context, id string) (JobQueue, error) {
 	var i JobQueue
 	err := row.Scan(
 		&i.ID,
+		&i.JobKey,
 		&i.QueueName,
 		&i.JobType,
 		&i.Body,
+		&i.Metadata,
 		&i.Priority,
 		&i.VisibleAfter,
 		&i.CreatedAt,
+		&i.ClaimedAt,
+		&i.ClaimedBy,
 		&i.RetryCount,
 		&i.MaxRetries,
 		&i.CompletedAt,
+		&i.TerminalCode,
+		&i.TerminalSummary,
+		&i.ResultJson,
+	)
+	return i, err
+}
+
+const getJobByKey = `-- name: GetJobByKey :one
+SELECT id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, completed_at, terminal_code, terminal_summary, result_json FROM job_queue WHERE queue_name = ? AND job_key = ?
+`
+
+type GetJobByKeyParams struct {
+	QueueName string
+	JobKey    string
+}
+
+func (q *Queries) GetJobByKey(ctx context.Context, arg GetJobByKeyParams) (JobQueue, error) {
+	row := q.db.QueryRowContext(ctx, getJobByKey, arg.QueueName, arg.JobKey)
+	var i JobQueue
+	err := row.Scan(
+		&i.ID,
+		&i.JobKey,
+		&i.QueueName,
+		&i.JobType,
+		&i.Body,
+		&i.Metadata,
+		&i.Priority,
+		&i.VisibleAfter,
+		&i.CreatedAt,
+		&i.ClaimedAt,
+		&i.ClaimedBy,
+		&i.RetryCount,
+		&i.MaxRetries,
+		&i.CompletedAt,
+		&i.TerminalCode,
+		&i.TerminalSummary,
+		&i.ResultJson,
 	)
 	return i, err
 }
 
 const getJobForUpdate = `-- name: GetJobForUpdate :one
-SELECT id, queue_name, job_type, body, priority, visible_after, created_at, retry_count, max_retries, completed_at FROM job_queue WHERE id = ?
+SELECT id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, completed_at, terminal_code, terminal_summary, result_json FROM job_queue WHERE id = ?
 `
 
 func (q *Queries) GetJobForUpdate(ctx context.Context, id string) (JobQueue, error) {
@@ -179,68 +304,91 @@ func (q *Queries) GetJobForUpdate(ctx context.Context, id string) (JobQueue, err
 	var i JobQueue
 	err := row.Scan(
 		&i.ID,
+		&i.JobKey,
 		&i.QueueName,
 		&i.JobType,
 		&i.Body,
+		&i.Metadata,
 		&i.Priority,
 		&i.VisibleAfter,
 		&i.CreatedAt,
+		&i.ClaimedAt,
+		&i.ClaimedBy,
 		&i.RetryCount,
 		&i.MaxRetries,
 		&i.CompletedAt,
+		&i.TerminalCode,
+		&i.TerminalSummary,
+		&i.ResultJson,
 	)
 	return i, err
 }
 
 const insertDLQ = `-- name: InsertDLQ :exec
 INSERT INTO job_queue_dlq (
-    id, queue_name, job_type, body, priority, created_at, failed_at, retry_count, error
+    id, job_key, queue_name, job_type, body, metadata, priority, created_at, failed_at, claimed_at, claimed_by, retry_count, error, terminal_code, terminal_summary, result_json
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 `
 
 type InsertDLQParams struct {
-	ID         string
-	QueueName  string
-	JobType    string
-	Body       []byte
-	Priority   int64
-	CreatedAt  int64
-	FailedAt   int64
-	RetryCount int64
-	Error      string
+	ID              string
+	JobKey          string
+	QueueName       string
+	JobType         string
+	Body            []byte
+	Metadata        string
+	Priority        int64
+	CreatedAt       int64
+	FailedAt        int64
+	ClaimedAt       sql.NullInt64
+	ClaimedBy       string
+	RetryCount      int64
+	Error           string
+	TerminalCode    string
+	TerminalSummary string
+	ResultJson      string
 }
 
 func (q *Queries) InsertDLQ(ctx context.Context, arg InsertDLQParams) error {
 	_, err := q.db.ExecContext(ctx, insertDLQ,
 		arg.ID,
+		arg.JobKey,
 		arg.QueueName,
 		arg.JobType,
 		arg.Body,
+		arg.Metadata,
 		arg.Priority,
 		arg.CreatedAt,
 		arg.FailedAt,
+		arg.ClaimedAt,
+		arg.ClaimedBy,
 		arg.RetryCount,
 		arg.Error,
+		arg.TerminalCode,
+		arg.TerminalSummary,
+		arg.ResultJson,
 	)
 	return err
 }
 
 const insertJob = `-- name: InsertJob :one
 INSERT INTO job_queue (
-    id, queue_name, job_type, body, priority, visible_after, created_at, retry_count, max_retries
+    id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, terminal_code, terminal_summary, result_json
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, 0, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0, ?, '', '', '{}'
 )
-RETURNING id, queue_name, job_type, body, priority, visible_after, created_at, retry_count, max_retries, completed_at
+RETURNING id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, completed_at, terminal_code, terminal_summary, result_json
 `
 
 type InsertJobParams struct {
 	ID           string
+	JobKey       string
 	QueueName    string
 	JobType      string
 	Body         []byte
+	Metadata     string
 	Priority     int64
 	VisibleAfter int64
 	CreatedAt    int64
@@ -250,9 +398,11 @@ type InsertJobParams struct {
 func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (JobQueue, error) {
 	row := q.db.QueryRowContext(ctx, insertJob,
 		arg.ID,
+		arg.JobKey,
 		arg.QueueName,
 		arg.JobType,
 		arg.Body,
+		arg.Metadata,
 		arg.Priority,
 		arg.VisibleAfter,
 		arg.CreatedAt,
@@ -261,21 +411,103 @@ func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (JobQueue,
 	var i JobQueue
 	err := row.Scan(
 		&i.ID,
+		&i.JobKey,
 		&i.QueueName,
 		&i.JobType,
 		&i.Body,
+		&i.Metadata,
 		&i.Priority,
 		&i.VisibleAfter,
 		&i.CreatedAt,
+		&i.ClaimedAt,
+		&i.ClaimedBy,
 		&i.RetryCount,
 		&i.MaxRetries,
 		&i.CompletedAt,
+		&i.TerminalCode,
+		&i.TerminalSummary,
+		&i.ResultJson,
 	)
 	return i, err
 }
 
+const insertJobUnique = `-- name: InsertJobUnique :many
+INSERT INTO job_queue (
+    id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, terminal_code, terminal_summary, result_json
+) VALUES (
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0, ?, '', '', '{}'
+)
+ON CONFLICT DO NOTHING
+RETURNING id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, completed_at, terminal_code, terminal_summary, result_json
+`
+
+type InsertJobUniqueParams struct {
+	ID           string
+	JobKey       string
+	QueueName    string
+	JobType      string
+	Body         []byte
+	Metadata     string
+	Priority     int64
+	VisibleAfter int64
+	CreatedAt    int64
+	MaxRetries   int64
+}
+
+func (q *Queries) InsertJobUnique(ctx context.Context, arg InsertJobUniqueParams) ([]JobQueue, error) {
+	rows, err := q.db.QueryContext(ctx, insertJobUnique,
+		arg.ID,
+		arg.JobKey,
+		arg.QueueName,
+		arg.JobType,
+		arg.Body,
+		arg.Metadata,
+		arg.Priority,
+		arg.VisibleAfter,
+		arg.CreatedAt,
+		arg.MaxRetries,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []JobQueue
+	for rows.Next() {
+		var i JobQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.JobKey,
+			&i.QueueName,
+			&i.JobType,
+			&i.Body,
+			&i.Metadata,
+			&i.Priority,
+			&i.VisibleAfter,
+			&i.CreatedAt,
+			&i.ClaimedAt,
+			&i.ClaimedBy,
+			&i.RetryCount,
+			&i.MaxRetries,
+			&i.CompletedAt,
+			&i.TerminalCode,
+			&i.TerminalSummary,
+			&i.ResultJson,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listCompletedJobs = `-- name: ListCompletedJobs :many
-SELECT id, queue_name, job_type, body, priority, visible_after, created_at, retry_count, max_retries, completed_at FROM job_queue
+SELECT id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, completed_at, terminal_code, terminal_summary, result_json FROM job_queue
 WHERE queue_name = ? AND completed_at IS NOT NULL
 ORDER BY completed_at DESC
 LIMIT ? OFFSET ?
@@ -298,15 +530,22 @@ func (q *Queries) ListCompletedJobs(ctx context.Context, arg ListCompletedJobsPa
 		var i JobQueue
 		if err := rows.Scan(
 			&i.ID,
+			&i.JobKey,
 			&i.QueueName,
 			&i.JobType,
 			&i.Body,
+			&i.Metadata,
 			&i.Priority,
 			&i.VisibleAfter,
 			&i.CreatedAt,
+			&i.ClaimedAt,
+			&i.ClaimedBy,
 			&i.RetryCount,
 			&i.MaxRetries,
 			&i.CompletedAt,
+			&i.TerminalCode,
+			&i.TerminalSummary,
+			&i.ResultJson,
 		); err != nil {
 			return nil, err
 		}
@@ -322,7 +561,7 @@ func (q *Queries) ListCompletedJobs(ctx context.Context, arg ListCompletedJobsPa
 }
 
 const listDLQJobs = `-- name: ListDLQJobs :many
-SELECT id, queue_name, job_type, body, priority, created_at, failed_at, retry_count, error FROM job_queue_dlq
+SELECT id, job_key, queue_name, job_type, body, metadata, priority, created_at, failed_at, claimed_at, claimed_by, retry_count, error, terminal_code, terminal_summary, result_json FROM job_queue_dlq
 WHERE queue_name = ?
 ORDER BY failed_at DESC
 LIMIT ? OFFSET ?
@@ -345,14 +584,21 @@ func (q *Queries) ListDLQJobs(ctx context.Context, arg ListDLQJobsParams) ([]Job
 		var i JobQueueDlq
 		if err := rows.Scan(
 			&i.ID,
+			&i.JobKey,
 			&i.QueueName,
 			&i.JobType,
 			&i.Body,
+			&i.Metadata,
 			&i.Priority,
 			&i.CreatedAt,
 			&i.FailedAt,
+			&i.ClaimedAt,
+			&i.ClaimedBy,
 			&i.RetryCount,
 			&i.Error,
+			&i.TerminalCode,
+			&i.TerminalSummary,
+			&i.ResultJson,
 		); err != nil {
 			return nil, err
 		}
@@ -368,7 +614,7 @@ func (q *Queries) ListDLQJobs(ctx context.Context, arg ListDLQJobsParams) ([]Job
 }
 
 const listPendingJobs = `-- name: ListPendingJobs :many
-SELECT id, queue_name, job_type, body, priority, visible_after, created_at, retry_count, max_retries, completed_at FROM job_queue
+SELECT id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, completed_at, terminal_code, terminal_summary, result_json FROM job_queue
 WHERE queue_name = ? AND completed_at IS NULL
 ORDER BY priority DESC, created_at ASC
 LIMIT ? OFFSET ?
@@ -391,15 +637,22 @@ func (q *Queries) ListPendingJobs(ctx context.Context, arg ListPendingJobsParams
 		var i JobQueue
 		if err := rows.Scan(
 			&i.ID,
+			&i.JobKey,
 			&i.QueueName,
 			&i.JobType,
 			&i.Body,
+			&i.Metadata,
 			&i.Priority,
 			&i.VisibleAfter,
 			&i.CreatedAt,
+			&i.ClaimedAt,
+			&i.ClaimedBy,
 			&i.RetryCount,
 			&i.MaxRetries,
 			&i.CompletedAt,
+			&i.TerminalCode,
+			&i.TerminalSummary,
+			&i.ResultJson,
 		); err != nil {
 			return nil, err
 		}
@@ -431,7 +684,7 @@ func (q *Queries) RetryJob(ctx context.Context, arg RetryJobParams) (sql.Result,
 }
 
 const sweepStuckJobs = `-- name: SweepStuckJobs :many
-SELECT id, queue_name, job_type, body, priority, visible_after, created_at, retry_count, max_retries, completed_at FROM job_queue
+SELECT id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, completed_at, terminal_code, terminal_summary, result_json FROM job_queue
 WHERE queue_name = ?
   AND completed_at IS NULL
   AND retry_count >= max_retries
@@ -449,15 +702,22 @@ func (q *Queries) SweepStuckJobs(ctx context.Context, queueName string) ([]JobQu
 		var i JobQueue
 		if err := rows.Scan(
 			&i.ID,
+			&i.JobKey,
 			&i.QueueName,
 			&i.JobType,
 			&i.Body,
+			&i.Metadata,
 			&i.Priority,
 			&i.VisibleAfter,
 			&i.CreatedAt,
+			&i.ClaimedAt,
+			&i.ClaimedBy,
 			&i.RetryCount,
 			&i.MaxRetries,
 			&i.CompletedAt,
+			&i.TerminalCode,
+			&i.TerminalSummary,
+			&i.ResultJson,
 		); err != nil {
 			return nil, err
 		}

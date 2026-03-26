@@ -1,15 +1,26 @@
 -- name: InsertJob :one
 INSERT INTO job_queue (
-    id, queue_name, job_type, body, priority, visible_after, created_at, retry_count, max_retries
+    id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, terminal_code, terminal_summary, result_json
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, 0, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0, ?, '', '', '{}'
 )
+RETURNING *;
+
+-- name: InsertJobUnique :many
+INSERT INTO job_queue (
+    id, job_key, queue_name, job_type, body, metadata, priority, visible_after, created_at, claimed_at, claimed_by, retry_count, max_retries, terminal_code, terminal_summary, result_json
+) VALUES (
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0, ?, '', '', '{}'
+)
+ON CONFLICT DO NOTHING
 RETURNING *;
 
 -- name: ClaimJob :one
 -- Atomically claim the next available pending job.
 UPDATE job_queue
-SET visible_after = ?
+SET visible_after = ?,
+    claimed_at = ?,
+    claimed_by = ?
 WHERE id = (
     SELECT jq.id FROM job_queue jq
     WHERE jq.queue_name = ?
@@ -27,6 +38,14 @@ RETURNING *;
 -- name: CompleteJob :execresult
 UPDATE job_queue SET completed_at = ? WHERE id = ?;
 
+-- name: CompleteJobWithResult :execresult
+UPDATE job_queue
+SET completed_at = ?,
+    terminal_code = ?,
+    terminal_summary = ?,
+    result_json = ?
+WHERE id = ?;
+
 -- name: RetryJob :execresult
 -- Record a failed attempt and make immediately visible.
 UPDATE job_queue
@@ -36,14 +55,17 @@ WHERE id = ? AND completed_at IS NULL;
 -- name: GetJob :one
 SELECT * FROM job_queue WHERE id = ?;
 
+-- name: GetJobByKey :one
+SELECT * FROM job_queue WHERE queue_name = ? AND job_key = ?;
+
 -- name: GetJobForUpdate :one
 SELECT * FROM job_queue WHERE id = ?;
 
 -- name: InsertDLQ :exec
 INSERT INTO job_queue_dlq (
-    id, queue_name, job_type, body, priority, created_at, failed_at, retry_count, error
+    id, job_key, queue_name, job_type, body, metadata, priority, created_at, failed_at, claimed_at, claimed_by, retry_count, error, terminal_code, terminal_summary, result_json
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 );
 
 -- name: DeleteJob :exec
@@ -51,6 +73,9 @@ DELETE FROM job_queue WHERE id = ?;
 
 -- name: GetDLQJob :one
 SELECT * FROM job_queue_dlq WHERE id = ?;
+
+-- name: GetDLQJobByKey :one
+SELECT * FROM job_queue_dlq WHERE queue_name = ? AND job_key = ?;
 
 -- name: DeleteDLQJob :exec
 DELETE FROM job_queue_dlq WHERE id = ?;

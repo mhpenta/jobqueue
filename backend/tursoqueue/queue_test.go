@@ -38,30 +38,48 @@ func testSetupWithConfig(t *testing.T, config jobqueue.Config) (*sql.DB, jobqueu
 	schema := `
 	CREATE TABLE job_queue (
 		id            TEXT PRIMARY KEY NOT NULL,
+		job_key       TEXT NOT NULL DEFAULT '',
 		queue_name    TEXT NOT NULL,
 		job_type      TEXT NOT NULL,
 		body          BLOB NOT NULL,
+		metadata      TEXT NOT NULL DEFAULT '{}',
 		priority      INTEGER NOT NULL DEFAULT 0,
 		visible_after INTEGER NOT NULL,
 		created_at    INTEGER NOT NULL,
+		claimed_at    INTEGER,
+		claimed_by    TEXT NOT NULL DEFAULT '',
 		retry_count   INTEGER NOT NULL DEFAULT 0,
 		max_retries   INTEGER NOT NULL DEFAULT 3,
-		completed_at  INTEGER
+		completed_at  INTEGER,
+		terminal_code TEXT NOT NULL DEFAULT '',
+		terminal_summary TEXT NOT NULL DEFAULT '',
+		result_json   TEXT NOT NULL DEFAULT '{}'
 	);
 
 	CREATE INDEX idx_job_queue_dequeue
 	ON job_queue(queue_name, completed_at, visible_after, priority DESC, created_at ASC);
 
+	CREATE UNIQUE INDEX idx_job_queue_job_key
+	ON job_queue(queue_name, job_key)
+	WHERE job_key <> '';
+
 	CREATE TABLE job_queue_dlq (
 		id          TEXT PRIMARY KEY NOT NULL,
+		job_key     TEXT NOT NULL DEFAULT '',
 		queue_name  TEXT NOT NULL,
 		job_type    TEXT NOT NULL,
 		body        BLOB NOT NULL,
+		metadata    TEXT NOT NULL DEFAULT '{}',
 		priority    INTEGER NOT NULL,
 		created_at  INTEGER NOT NULL,
 		failed_at   INTEGER NOT NULL,
+		claimed_at  INTEGER,
+		claimed_by  TEXT NOT NULL DEFAULT '',
 		retry_count INTEGER NOT NULL,
-		error       TEXT NOT NULL
+		error       TEXT NOT NULL,
+		terminal_code TEXT NOT NULL DEFAULT '',
+		terminal_summary TEXT NOT NULL DEFAULT '',
+		result_json TEXT NOT NULL DEFAULT '{}'
 	);
 	`
 
@@ -133,6 +151,121 @@ func TestDequeueEmptyQueue(t *testing.T) {
 	}
 	if msg != nil {
 		t.Errorf("Dequeue returned msg %v, want nil", msg)
+	}
+}
+
+func TestEnqueueUniqueByJobKey(t *testing.T) {
+	_, queue := testSetup(t)
+	ctx := context.Background()
+
+	body := mustMarshal(t, TestPayload{Message: "hello"})
+	firstID, created, err := jobqueue.EnqueueUnique(ctx, queue, "test-queue", "test-job", body,
+		jobqueue.WithJobKey("dataset_update:spec-1:2026-03-26"),
+		jobqueue.WithMetadata(map[string]any{"spec_id": "spec-1"}),
+	)
+	if err != nil {
+		t.Fatalf("first EnqueueUnique failed: %v", err)
+	}
+	if !created {
+		t.Fatal("first EnqueueUnique should create a job")
+	}
+
+	secondID, created, err := jobqueue.EnqueueUnique(ctx, queue, "test-queue", "test-job", body,
+		jobqueue.WithJobKey("dataset_update:spec-1:2026-03-26"),
+		jobqueue.WithMetadata(map[string]any{"spec_id": "spec-1"}),
+	)
+	if err != nil {
+		t.Fatalf("second EnqueueUnique failed: %v", err)
+	}
+	if created {
+		t.Fatal("second EnqueueUnique should return existing job")
+	}
+	if secondID != firstID {
+		t.Fatalf("EnqueueUnique returned %q, want existing %q", secondID, firstID)
+	}
+}
+
+func TestDequeueWithWorkerRecordsClaimMetadata(t *testing.T) {
+	_, queue := testSetup(t)
+	ctx := context.Background()
+
+	body := mustMarshal(t, TestPayload{Message: "claimed"})
+	jobID, err := queue.Enqueue(ctx, "test-queue", "test-job", body, jobqueue.WithJobKey("claim-key"))
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	msg, err := jobqueue.DequeueWithWorker(ctx, queue, "test-queue", "codex-worker")
+	if err != nil {
+		t.Fatalf("DequeueWithWorker failed: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("DequeueWithWorker returned nil")
+	}
+	if msg.ID != jobID {
+		t.Fatalf("claimed job id = %q, want %q", msg.ID, jobID)
+	}
+	if msg.ClaimedBy != "codex-worker" {
+		t.Fatalf("ClaimedBy = %q, want %q", msg.ClaimedBy, "codex-worker")
+	}
+	if msg.ClaimedAt.IsZero() {
+		t.Fatal("ClaimedAt should be recorded")
+	}
+}
+
+func TestCompleteWithResultStoresOutcome(t *testing.T) {
+	_, queue := testSetup(t)
+	ctx := context.Background()
+
+	body := mustMarshal(t, TestPayload{Message: "complete"})
+	_, err := queue.Enqueue(ctx, "test-queue", "test-job", body, jobqueue.WithJobKey("complete-key"))
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	if _, err := jobqueue.DequeueWithWorker(ctx, queue, "test-queue", "codex-worker"); err != nil {
+		t.Fatalf("DequeueWithWorker failed: %v", err)
+	}
+
+	if err := jobqueue.CompleteWithResult(ctx, queue, "complete-key", jobqueue.JobResult{}); err == nil {
+		t.Fatal("CompleteWithResult by job key should fail; expected job ID lookup only")
+	}
+}
+
+func TestCompleteWithResultByJobIDStoresOutcome(t *testing.T) {
+	_, queue := testSetup(t)
+	ctx := context.Background()
+
+	body := mustMarshal(t, TestPayload{Message: "complete"})
+	jobID, err := queue.Enqueue(ctx, "test-queue", "test-job", body, jobqueue.WithJobKey("complete-key"))
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	if _, err := jobqueue.DequeueWithWorker(ctx, queue, "test-queue", "codex-worker"); err != nil {
+		t.Fatalf("DequeueWithWorker failed: %v", err)
+	}
+
+	if err := jobqueue.CompleteWithResult(ctx, queue, jobID, jobqueue.JobResult{
+		Code:    "done",
+		Summary: "loaded new fertilizer points",
+		Payload: map[string]any{"run_id": "run-1"},
+	}); err != nil {
+		t.Fatalf("CompleteWithResult failed: %v", err)
+	}
+
+	jobMsg, err := jobqueue.GetJobByKey(ctx, queue, "test-queue", "complete-key")
+	if err != nil {
+		t.Fatalf("GetJobByKey failed: %v", err)
+	}
+	if jobMsg.TerminalCode != "done" {
+		t.Fatalf("TerminalCode = %q, want %q", jobMsg.TerminalCode, "done")
+	}
+	if jobMsg.TerminalSummary != "loaded new fertilizer points" {
+		t.Fatalf("TerminalSummary = %q", jobMsg.TerminalSummary)
+	}
+	if jobMsg.CompletedAt.IsZero() {
+		t.Fatal("CompletedAt should be set")
 	}
 }
 

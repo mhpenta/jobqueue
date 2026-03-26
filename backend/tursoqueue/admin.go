@@ -48,17 +48,7 @@ func (q *TursoQueue) ListDLQJobs(ctx context.Context, queueName string, limit, o
 	}
 	msgs := make([]jobqueue.DLQMessage, len(rows))
 	for i, row := range rows {
-		msgs[i] = jobqueue.DLQMessage{
-			ID:         row.ID,
-			QueueName:  row.QueueName,
-			JobType:    row.JobType,
-			Body:       row.Body,
-			Priority:   int(row.Priority),
-			CreatedAt:  time.Unix(row.CreatedAt, 0),
-			FailedAt:   time.Unix(row.FailedAt, 0),
-			RetryCount: int(row.RetryCount),
-			Error:      row.Error,
-		}
+		msgs[i] = *dlqMessageFromSQLiteRow(row)
 	}
 	return msgs, nil
 }
@@ -108,15 +98,22 @@ func (q *TursoQueue) SweepStuckJobs(ctx context.Context, queueName string) (int,
 
 	for _, job := range stuck {
 		err = qtx.InsertDLQ(ctx, db.InsertDLQParams{
-			ID:         job.ID,
-			QueueName:  job.QueueName,
-			JobType:    job.JobType,
-			Body:       job.Body,
-			Priority:   job.Priority,
-			CreatedAt:  job.CreatedAt,
-			FailedAt:   now,
-			RetryCount: job.RetryCount,
-			Error:      "swept: retry count exhausted",
+			ID:              job.ID,
+			JobKey:          job.JobKey,
+			QueueName:       job.QueueName,
+			JobType:         job.JobType,
+			Body:            job.Body,
+			Metadata:        job.Metadata,
+			Priority:        job.Priority,
+			CreatedAt:       job.CreatedAt,
+			FailedAt:        now,
+			ClaimedAt:       job.ClaimedAt,
+			ClaimedBy:       job.ClaimedBy,
+			RetryCount:      job.RetryCount,
+			Error:           "swept: retry count exhausted",
+			TerminalCode:    job.TerminalCode,
+			TerminalSummary: job.TerminalSummary,
+			ResultJson:      job.ResultJson,
 		})
 		if err != nil {
 			return 0, fmt.Errorf("failed to insert swept job %s into DLQ: %w", job.ID, err)
@@ -140,16 +137,7 @@ func (q *TursoQueue) DeleteDLQJob(ctx context.Context, jobID string) error {
 func convertJobRows(rows []db.JobQueue) []jobqueue.Message {
 	msgs := make([]jobqueue.Message, len(rows))
 	for i, row := range rows {
-		msgs[i] = jobqueue.Message{
-			ID:         row.ID,
-			QueueName:  row.QueueName,
-			JobType:    row.JobType,
-			Body:       row.Body,
-			Priority:   int(row.Priority),
-			CreatedAt:  time.Unix(row.CreatedAt, 0),
-			RetryCount: int(row.RetryCount),
-			MaxRetries: int(row.MaxRetries),
-		}
+		msgs[i] = *messageFromSQLiteJobRow(row)
 	}
 	return msgs
 }

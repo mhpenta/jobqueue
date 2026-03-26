@@ -9,10 +9,12 @@ var (
 	ErrEmptyQueueName = errors.New("jobqueue: queue name must not be empty")
 	ErrEmptyJobType   = errors.New("jobqueue: job type must not be empty")
 	ErrEmptyJobID     = errors.New("jobqueue: job ID must not be empty")
+	ErrEmptyJobKey    = errors.New("jobqueue: job key must not be empty")
 	ErrNilBody        = errors.New("jobqueue: body must not be nil")
 	ErrJobNotFound    = errors.New("jobqueue: job not found")
 	ErrJobCompleted   = errors.New("jobqueue: job already completed")
 	ErrJobNotPending  = errors.New("jobqueue: job not pending")
+	ErrUnsupported    = errors.New("jobqueue: queue feature not supported")
 )
 
 func ValidateEnqueue(queueName, jobType string, body []byte) error {
@@ -38,6 +40,13 @@ func ValidateQueueName(queueName string) error {
 func ValidateJobID(jobID string) error {
 	if strings.TrimSpace(jobID) == "" {
 		return ErrEmptyJobID
+	}
+	return nil
+}
+
+func ValidateJobKey(jobKey string) error {
+	if strings.TrimSpace(jobKey) == "" {
+		return ErrEmptyJobKey
 	}
 	return nil
 }

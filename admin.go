@@ -2,6 +2,7 @@ package jobqueue
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -41,13 +42,20 @@ type Admin interface {
 
 // DLQMessage contains a dead-letter job's data and failure metadata.
 type DLQMessage struct {
-	ID         string
-	QueueName  string
-	JobType    string
-	Body       []byte
-	Priority   int
-	CreatedAt  time.Time
-	FailedAt   time.Time
-	RetryCount int
-	Error      string
+	ID              string
+	JobKey          string
+	QueueName       string
+	JobType         string
+	Body            []byte
+	Metadata        json.RawMessage
+	Priority        int
+	CreatedAt       time.Time
+	FailedAt        time.Time
+	ClaimedAt       time.Time
+	ClaimedBy       string
+	RetryCount      int
+	Error           string
+	TerminalCode    string
+	TerminalSummary string
+	ResultJSON      json.RawMessage
 }
