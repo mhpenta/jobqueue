@@ -132,11 +132,11 @@ func (q *PostgresQueue) DequeueWithWorker(ctx context.Context, queueName string,
 	}
 
 	row, err := q.queries.ClaimJob(ctx, db.ClaimJobParams{
-		VisibleAfter:   newVisibleAfter,
-		ClaimedAt:      sql.NullInt64{Int64: now, Valid: true},
-		ClaimedBy:      strings.TrimSpace(workerName),
-		QueueName:      queueName,
-		VisibleAfter_2: now,
+		LeaseUntil: newVisibleAfter,
+		ClaimedAt:  sql.NullInt64{Int64: now, Valid: true},
+		ClaimedBy:  strings.TrimSpace(workerName),
+		QueueName:  queueName,
+		Now:        now,
 	})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -174,7 +174,7 @@ func (q *PostgresQueue) complete(ctx context.Context, jobID string, result *jobq
 			return err
 		}
 		if rows == 0 {
-			return jobqueue.ErrJobNotFound
+			return q.notCompletable(ctx, jobID)
 		}
 		return nil
 	}
@@ -199,30 +199,88 @@ func (q *PostgresQueue) complete(ctx context.Context, jobID string, result *jobq
 		return err
 	}
 	if rows == 0 {
-		return jobqueue.ErrJobNotFound
+		return q.notCompletable(ctx, jobID)
 	}
 	return nil
 }
 
+// notCompletable handles a completion that matched no pending row. Completing
+// an already-completed job is a no-op that keeps the first completion's time
+// and result.
+func (q *PostgresQueue) notCompletable(ctx context.Context, jobID string) error {
+	job, err := q.queries.GetJob(ctx, jobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return jobqueue.ErrJobNotFound
+		}
+		return fmt.Errorf("get job: %w", err)
+	}
+	if job.CompletedAt.Valid {
+		return nil
+	}
+	return jobqueue.ErrJobNotFound
+}
+
+// Retry records a failed attempt and releases the job for another one, after
+// Config.RetryBackoff if set. If that attempt would exceed MaxRetries, the job
+// moves to the dead-letter queue instead; call Fail directly (see
+// Message.ShouldRetry) to keep the processing error there.
 func (q *PostgresQueue) Retry(ctx context.Context, jobID string) error {
 	if err := jobqueue.ValidateJobID(jobID); err != nil {
 		return err
 	}
-	result, err := q.queries.RetryJob(ctx, db.RetryJobParams{
-		VisibleAfter: 0,
-		ID:           jobID,
-	})
+
+	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	rows, err := result.RowsAffected()
+	defer tx.Rollback()
+
+	qtx := q.queries.WithTx(tx)
+
+	job, err := qtx.GetJobForUpdate(ctx, jobID)
 	if err != nil {
-		return err
+		if errors.Is(err, sql.ErrNoRows) {
+			return jobqueue.ErrJobNotPending
+		}
+		return fmt.Errorf("failed to get job: %w", err)
 	}
-	if rows == 0 {
+	if job.CompletedAt.Valid {
 		return jobqueue.ErrJobNotPending
 	}
-	return nil
+
+	t := time.Now()
+	retryCount := job.RetryCount + 1
+	if retryCount >= job.MaxRetries {
+		err := moveToDLQ(ctx, qtx, job, dlqEntry{
+			retryCount: retryCount,
+			errMsg:     "jobqueue: retry limit reached",
+			failedAt:   t.Unix(),
+			resultJSON: job.ResultJson,
+			code:       job.TerminalCode,
+			summary:    job.TerminalSummary,
+		})
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	visibleAfter := int64(0)
+	if delay := q.config.RetryDelay(int(retryCount)); delay > 0 {
+		visibleAfter = t.Add(delay).Unix()
+		if visibleAfter <= t.Unix() {
+			visibleAfter = t.Unix() + 1
+		}
+	}
+	if _, err := qtx.ReleaseJob(ctx, db.ReleaseJobParams{
+		VisibleAfter: visibleAfter,
+		RetryCount:   retryCount,
+		ID:           jobID,
+	}); err != nil {
+		return fmt.Errorf("failed to release job: %w", err)
+	}
+	return tx.Commit()
 }
 
 func (q *PostgresQueue) Fail(ctx context.Context, jobID string, jobErr error) error {
@@ -262,32 +320,16 @@ func (q *PostgresQueue) FailWithResult(ctx context.Context, jobID string, jobErr
 		return jobqueue.ErrJobCompleted
 	}
 
-	now := time.Now().Unix()
-
-	err = qtx.InsertDLQ(ctx, db.InsertDLQParams{
-		ID:              job.ID,
-		JobKey:          job.JobKey,
-		QueueName:       job.QueueName,
-		JobType:         job.JobType,
-		Body:            job.Body,
-		Metadata:        job.Metadata,
-		Priority:        job.Priority,
-		CreatedAt:       job.CreatedAt,
-		FailedAt:        now,
-		ClaimedAt:       job.ClaimedAt,
-		ClaimedBy:       job.ClaimedBy,
-		RetryCount:      job.RetryCount,
-		Error:           errMsg,
-		TerminalCode:    strings.TrimSpace(result.Code),
-		TerminalSummary: strings.TrimSpace(result.Summary),
-		ResultJson:      resultJSON,
+	err = moveToDLQ(ctx, qtx, job, dlqEntry{
+		retryCount: job.RetryCount,
+		errMsg:     errMsg,
+		failedAt:   time.Now().Unix(),
+		resultJSON: resultJSON,
+		code:       strings.TrimSpace(result.Code),
+		summary:    strings.TrimSpace(result.Summary),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to insert into DLQ: %w", err)
-	}
-
-	if err := qtx.DeleteJob(ctx, jobID); err != nil {
-		return fmt.Errorf("failed to delete job: %w", err)
+		return err
 	}
 
 	return tx.Commit()
@@ -359,6 +401,53 @@ func (q *PostgresQueue) GetDLQJobByKey(ctx context.Context, queueName string, jo
 		return nil, fmt.Errorf("get dlq job by key: %w", err)
 	}
 	return dlqMessageFromRow(row), nil
+}
+
+// dlqEntry holds the dead-letter fields that differ between Fail, Retry, and
+// SweepStuckJobs.
+type dlqEntry struct {
+	retryCount int32
+	errMsg     string
+	failedAt   int64
+	resultJSON json.RawMessage
+	code       string
+	summary    string
+}
+
+// moveToDLQ copies job into the dead-letter queue and deletes it from
+// job_queue. Callers run it inside a transaction.
+func moveToDLQ(ctx context.Context, qtx *db.Queries, job db.JobQueue, e dlqEntry) error {
+	err := qtx.InsertDLQ(ctx, db.InsertDLQParams{
+		ID:              job.ID,
+		JobKey:          job.JobKey,
+		QueueName:       job.QueueName,
+		JobType:         job.JobType,
+		Body:            job.Body,
+		Metadata:        job.Metadata,
+		Priority:        job.Priority,
+		CreatedAt:       job.CreatedAt,
+		FailedAt:        e.failedAt,
+		ClaimedAt:       job.ClaimedAt,
+		ClaimedBy:       job.ClaimedBy,
+		RetryCount:      e.retryCount,
+		Error:           e.errMsg,
+		TerminalCode:    e.code,
+		TerminalSummary: e.summary,
+		ResultJson:      e.resultJSON,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to insert job %s into DLQ: %w", job.ID, err)
+	}
+	if err := qtx.DeleteJob(ctx, job.ID); err != nil {
+		return fmt.Errorf("failed to delete job %s: %w", job.ID, err)
+	}
+	return nil
+}
+
+// leaseExpired reports whether job was claimed and its lease ran out before
+// Complete, Retry, or Fail. It mirrors the ClaimJob and SweepStuckJobs SQL.
+func leaseExpired(job db.JobQueue, now int64) bool {
+	return job.ClaimedAt.Valid && job.VisibleAfter > 0 && job.VisibleAfter <= now
 }
 
 func encodeJSONValue(value any) (json.RawMessage, error) {

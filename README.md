@@ -23,6 +23,32 @@ if msg != nil {
 }
 ```
 
+## Retries, Leases, and the Dead-Letter Queue
+
+`Dequeue` claims a job for `Config.VisibilityTimeout`. After a failure:
+
+```go
+if msg.ShouldRetry() {
+	queue.Retry(ctx, msg.ID) // another attempt, after Config.RetryBackoff if set
+} else {
+	queue.Fail(ctx, msg.ID, err) // dead-letter it, keeping the real error
+}
+```
+
+- `MaxRetries` is the total number of attempts (`0` still allows one).
+- A claim whose visibility timeout runs out without `Complete`, `Retry`, or
+  `Fail` counts as a failed attempt, so a job that crashes its worker is not
+  redelivered forever.
+- A `Retry` that would use up the last attempt moves the job to the
+  dead-letter queue. A job whose lease expires on its last attempt is moved
+  there by `Admin.SweepStuckJobs`.
+- Completing a job twice is a no-op; the first completion's time and result
+  are kept.
+
+`Complete`, `Retry`, and `Fail` take only the job ID and do not check which
+worker holds the claim, so keep `VisibilityTimeout` longer than your slowest
+job.
+
 ## Backend Schema Bootstrap
 
 The Postgres backend exports its canonical schema so callers do not need to copy

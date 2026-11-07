@@ -440,7 +440,9 @@ func TestMaxRetries(t *testing.T) {
 		if msg == nil {
 			t.Fatalf("attempt %d: got nil", i+1)
 		}
-		queue.Retry(ctx, msg.ID)
+		if err := queue.Retry(ctx, msg.ID); err != nil {
+			t.Fatalf("attempt %d: Retry failed: %v", i+1, err)
+		}
 	}
 
 	msg, _ := queue.Dequeue(ctx, "test-queue")
@@ -448,10 +450,22 @@ func TestMaxRetries(t *testing.T) {
 		t.Errorf("job should not be dequeued after max retries, retry_count = %d", msg.RetryCount)
 	}
 
+	var pending int
+	db.QueryRow("SELECT COUNT(*) FROM job_queue WHERE queue_name = 'test-queue'").Scan(&pending)
+	if pending != 0 {
+		t.Errorf("job_queue rows = %d, want 0 (the final Retry should dead-letter the job)", pending)
+	}
+
 	var retryCount int
-	db.QueryRow("SELECT retry_count FROM job_queue WHERE queue_name = 'test-queue'").Scan(&retryCount)
+	var errMsg string
+	if err := db.QueryRow("SELECT retry_count, error FROM job_queue_dlq WHERE queue_name = 'test-queue'").Scan(&retryCount, &errMsg); err != nil {
+		t.Fatalf("query DLQ: %v", err)
+	}
 	if retryCount != 3 {
-		t.Errorf("retry_count = %d, want 3", retryCount)
+		t.Errorf("DLQ retry_count = %d, want 3", retryCount)
+	}
+	if errMsg != "jobqueue: retry limit reached" {
+		t.Errorf("DLQ error = %q", errMsg)
 	}
 }
 
@@ -683,22 +697,23 @@ func TestCompleteOnNonexistentJob(t *testing.T) {
 }
 
 func TestShouldRetry(t *testing.T) {
-	msg := &jobqueue.Message{
-		RetryCount: 2,
-		MaxRetries: 3,
+	tests := []struct {
+		retryCount, maxRetries int
+		want                   bool
+	}{
+		{0, 3, true},
+		{1, 3, true},
+		{2, 3, false}, // the third attempt is the last one: Fail it
+		{3, 3, false},
+		{5, 3, false},
+		{0, 1, false},
+		{0, 0, false},
 	}
-	if !msg.ShouldRetry() {
-		t.Error("ShouldRetry should be true when RetryCount < MaxRetries")
-	}
-
-	msg.RetryCount = 3
-	if msg.ShouldRetry() {
-		t.Error("ShouldRetry should be false when RetryCount >= MaxRetries")
-	}
-
-	msg.RetryCount = 5
-	if msg.ShouldRetry() {
-		t.Error("ShouldRetry should be false when RetryCount > MaxRetries")
+	for _, tt := range tests {
+		msg := &jobqueue.Message{RetryCount: tt.retryCount, MaxRetries: tt.maxRetries}
+		if got := msg.ShouldRetry(); got != tt.want {
+			t.Errorf("ShouldRetry(RetryCount=%d, MaxRetries=%d) = %v, want %v", tt.retryCount, tt.maxRetries, got, tt.want)
+		}
 	}
 }
 
@@ -918,19 +933,18 @@ func TestAdminCleanupCompletedJobs(t *testing.T) {
 }
 
 func TestAdminSweepStuckJobs(t *testing.T) {
-	_, q := testSetup(t)
+	db, q := testSetup(t)
 	admin := q.(*tursoqueue.TursoQueue)
 	ctx := context.Background()
 
 	body := mustMarshal(t, TestPayload{Message: "stuck"})
-	q.Enqueue(ctx, "test-queue", "test-job", body)
+	id, _ := q.Enqueue(ctx, "test-queue", "test-job", body)
+	q.Dequeue(ctx, "test-queue")
 
-	for i := 0; i < 3; i++ {
-		msg, _ := q.Dequeue(ctx, "test-queue")
-		if msg == nil {
-			t.Fatalf("attempt %d: got nil", i+1)
-		}
-		q.Retry(ctx, msg.ID)
+	// Versions before v0.5.0 left exhausted jobs in job_queue: the last Retry
+	// incremented retry_count to max_retries and set visible_after to 0.
+	if _, err := db.Exec("UPDATE job_queue SET retry_count = 3, visible_after = 0 WHERE id = ?", id); err != nil {
+		t.Fatalf("simulate legacy exhausted row: %v", err)
 	}
 
 	msg, _ := q.Dequeue(ctx, "test-queue")
@@ -956,16 +970,14 @@ func TestAdminSweepStuckJobs(t *testing.T) {
 		t.Errorf("pending after sweep = %d, want 0", pending)
 	}
 
-	dlqCount, _ := admin.CountDLQJobs(ctx, "test-queue")
-	if dlqCount != 1 {
-		t.Errorf("DLQ count after sweep = %d, want 1", dlqCount)
-	}
-
 	dlqJobs, _ := admin.ListDLQJobs(ctx, "test-queue", 10, 0)
 	if len(dlqJobs) != 1 {
 		t.Fatalf("expected 1 DLQ job, got %d", len(dlqJobs))
 	}
 	if dlqJobs[0].Error != "swept: retry count exhausted" {
 		t.Errorf("DLQ error = %q, want %q", dlqJobs[0].Error, "swept: retry count exhausted")
+	}
+	if dlqJobs[0].RetryCount != 3 {
+		t.Errorf("DLQ retry count = %d, want 3", dlqJobs[0].RetryCount)
 	}
 }

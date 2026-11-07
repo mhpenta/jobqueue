@@ -72,7 +72,7 @@ func applySchema(db *sql.DB) error {
 }
 
 func dropTables(db *sql.DB) error {
-	_, err := db.Exec(`DROP TABLE IF EXISTS job_queue_dlq; DROP TABLE IF EXISTS job_queue;`)
+	_, err := db.Exec(`DROP TABLE IF EXISTS job_queue_dlq CASCADE; DROP TABLE IF EXISTS job_queue CASCADE;`)
 	return err
 }
 
@@ -161,13 +161,24 @@ func TestRetryAndMaxRetries(t *testing.T) {
 		t.Errorf("job should not be dequeued after max retries, retry_count = %d", msg.RetryCount)
 	}
 
+	var pending int
+	if err := db.QueryRow("SELECT COUNT(*) FROM job_queue WHERE queue_name = 'test-queue'").Scan(&pending); err != nil {
+		t.Fatalf("count job_queue: %v", err)
+	}
+	if pending != 0 {
+		t.Errorf("job_queue rows = %d, want 0 (the final Retry should dead-letter the job)", pending)
+	}
+
 	var retryCount int
-	err := db.QueryRow("SELECT retry_count FROM job_queue WHERE queue_name = 'test-queue'").Scan(&retryCount)
-	if err != nil {
-		t.Fatalf("failed to query retry_count: %v", err)
+	var errMsg string
+	if err := db.QueryRow("SELECT retry_count, error FROM job_queue_dlq WHERE queue_name = 'test-queue'").Scan(&retryCount, &errMsg); err != nil {
+		t.Fatalf("query DLQ: %v", err)
 	}
 	if retryCount != 3 {
-		t.Errorf("retry_count = %d, want 3", retryCount)
+		t.Errorf("DLQ retry_count = %d, want 3", retryCount)
+	}
+	if errMsg != "jobqueue: retry limit reached" {
+		t.Errorf("DLQ error = %q", errMsg)
 	}
 }
 

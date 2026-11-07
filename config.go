@@ -10,6 +10,24 @@ type Config struct {
 	// VisibilityTimeout is how long a dequeued job stays invisible.
 	// If not acknowledged within this time, it becomes visible again.
 	VisibilityTimeout time.Duration
+
+	// RetryBackoff optionally delays a job after Retry. It receives the job's
+	// new RetryCount (1 after the first failure). Nil, or a non-positive
+	// duration, makes the job visible again immediately.
+	RetryBackoff func(retryCount int) time.Duration
+}
+
+// RetryDelay returns how long a job should stay invisible after a Retry that
+// brings its RetryCount to retryCount. Backends call this; it is zero unless
+// RetryBackoff is set.
+func (c Config) RetryDelay(retryCount int) time.Duration {
+	if c.RetryBackoff == nil {
+		return 0
+	}
+	if d := c.RetryBackoff(retryCount); d > 0 {
+		return d
+	}
+	return 0
 }
 
 // DefaultConfig returns a Config with sensible defaults.

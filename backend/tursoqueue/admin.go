@@ -79,7 +79,8 @@ func (q *TursoQueue) CleanupCompletedJobs(ctx context.Context, olderThan time.Ti
 // SweepStuckJobs finds jobs that exhausted their retries but were never completed
 // or moved to DLQ, and moves each to the DLQ. Returns the number swept.
 func (q *TursoQueue) SweepStuckJobs(ctx context.Context, queueName string) (int, error) {
-	stuck, err := q.queries.SweepStuckJobs(ctx, queueName)
+	now := time.Now().Unix()
+	stuck, err := q.queries.SweepStuckJobs(ctx, db.SweepStuckJobsParams{QueueName: queueName, Now: now})
 	if err != nil {
 		return 0, fmt.Errorf("failed to find stuck jobs: %w", err)
 	}
@@ -94,32 +95,22 @@ func (q *TursoQueue) SweepStuckJobs(ctx context.Context, queueName string) (int,
 	defer tx.Rollback()
 
 	qtx := q.queries.WithTx(tx)
-	now := time.Now().Unix()
 
 	for _, job := range stuck {
-		err = qtx.InsertDLQ(ctx, db.InsertDLQParams{
-			ID:              job.ID,
-			JobKey:          job.JobKey,
-			QueueName:       job.QueueName,
-			JobType:         job.JobType,
-			Body:            job.Body,
-			Metadata:        job.Metadata,
-			Priority:        job.Priority,
-			CreatedAt:       job.CreatedAt,
-			FailedAt:        now,
-			ClaimedAt:       job.ClaimedAt,
-			ClaimedBy:       job.ClaimedBy,
-			RetryCount:      job.RetryCount,
-			Error:           "swept: retry count exhausted",
-			TerminalCode:    job.TerminalCode,
-			TerminalSummary: job.TerminalSummary,
-			ResultJson:      job.ResultJson,
-		})
-		if err != nil {
-			return 0, fmt.Errorf("failed to insert swept job %s into DLQ: %w", job.ID, err)
+		e := dlqEntry{
+			retryCount: job.RetryCount,
+			errMsg:     "swept: retry count exhausted",
+			failedAt:   now,
+			resultJSON: job.ResultJson,
+			code:       job.TerminalCode,
+			summary:    job.TerminalSummary,
 		}
-		if err := qtx.DeleteJob(ctx, job.ID); err != nil {
-			return 0, fmt.Errorf("failed to delete swept job %s: %w", job.ID, err)
+		if !(job.RetryCount > 0 && job.RetryCount >= job.MaxRetries) && leaseExpired(job, now) {
+			e.retryCount = job.RetryCount + 1
+			e.errMsg = "swept: visibility timeout expired on the last attempt"
+		}
+		if err := moveToDLQ(ctx, qtx, job, e); err != nil {
+			return 0, err
 		}
 	}
 
